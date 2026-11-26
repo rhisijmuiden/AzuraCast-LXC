@@ -28,6 +28,7 @@ final class NativeRelease
     /** Directory watched by the azuracast-updater systemd path unit. */
     public const string UPDATER_DIR = '/var/azuracast/updater';
 
+    /** @var array{version: string, tag: string, channel: string, repository: string}|null */
     private ?array $releaseInfo = null;
 
     public function __construct(
