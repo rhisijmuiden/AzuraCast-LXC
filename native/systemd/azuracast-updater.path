@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for update requests from the AzuraCast web interface
+
+[Path]
+PathExists=/var/azuracast/updater/request
+Unit=azuracast-updater.service
+
+[Install]
+WantedBy=multi-user.target

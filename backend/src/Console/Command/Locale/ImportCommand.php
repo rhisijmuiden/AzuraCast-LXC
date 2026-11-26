@@ -49,6 +49,12 @@ final class ImportCommand extends CommandAbstract
 
             if (is_file($localeSource)) {
                 $translations = $poLoader->loadFile($localeSource);
+
+                // AzuraCast-LXC (native install) strings live in a separate file so upstream syncs don't conflict.
+                $nativeSource = $localeFolder . '/LC_MESSAGES/native.po';
+                if (is_file($nativeSource)) {
+                    $translations = $translations->mergeWith($poLoader->loadFile($nativeSource));
+                }
                 $arrayGenerator->generateFile($translations, $localeDest);
 
                 (new JsonGenerator($supportedLocale))->generateFile($translations, $jsonDest);

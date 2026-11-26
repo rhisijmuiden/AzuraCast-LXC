@@ -16,7 +16,8 @@ final class WebUpdater
     public const string WATCHTOWER_TOKEN = 'azur4c457';
 
     public function __construct(
-        private readonly GuzzleFactory $guzzleFactory
+        private readonly GuzzleFactory $guzzleFactory,
+        private readonly NativeRelease $nativeRelease,
     ) {
     }
 
@@ -29,6 +30,10 @@ final class WebUpdater
     {
         if (!$this->isSupported()) {
             return false;
+        }
+
+        if ($this->environment->isNative()) {
+            return $this->nativeRelease->isUpdaterAvailable();
         }
 
         try {
@@ -51,6 +56,11 @@ final class WebUpdater
     {
         if (!$this->isSupported()) {
             throw new RuntimeException('Web updates are not supported on this installation.');
+        }
+
+        if ($this->environment->isNative()) {
+            $this->nativeRelease->requestUpdate();
+            return;
         }
 
         $client = $this->guzzleFactory->buildClient();

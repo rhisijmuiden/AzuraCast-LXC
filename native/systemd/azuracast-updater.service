@@ -1,0 +1,8 @@
+[Unit]
+Description=AzuraCast-LXC updater (started from the web interface)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/azuracast-ctl update --from-request
+TimeoutStartSec=3600

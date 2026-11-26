@@ -1,0 +1,83 @@
+name: AzuraCast-LXC native release
+
+# main = production channel: a release vX.Y.Z (once per native/VERSION; bump it to release again).
+# test = test channel: a prerelease vX.Y.Z-test.<run number> on every push.
+on:
+  push:
+    branches:
+      - main
+      - test
+    paths-ignore:
+      - '*.md'
+      - 'native/*.md'
+  workflow_dispatch:
+
+concurrency:
+  group: native-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  checks:
+    uses: ./.github/workflows/native-checks.yml
+
+  release:
+    name: Build and publish release
+    needs: checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out version and tag
+        id: ver
+        run: |
+          base="$(tr -d '[:space:]' < native/VERSION)"
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then
+            tag="v${base}"
+            if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null; then
+              echo "Tag ${tag} already exists; bump native/VERSION to publish a new production release."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            tag="v${base}-test.${GITHUB_RUN_NUMBER}"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Setup PHP
+        if: steps.ver.outputs.skip != 'true'
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: intl, gmp, zip, gd, maxminddb
+          tools: composer:v2
+
+      - name: Setup Node
+        if: steps.ver.outputs.skip != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+          cache: npm
+
+      - name: Build release
+        if: steps.ver.outputs.skip != 'true'
+        run: bash native/build-release.sh "${{ steps.ver.outputs.version }}" "${{ runner.temp }}/dist"
+
+      - name: Publish release
+        if: steps.ver.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=""
+          [ "${{ steps.ver.outputs.prerelease }}" = "true" ] && flags="--prerelease"
+          gh release create "${{ steps.ver.outputs.tag }}" "${{ runner.temp }}"/dist/* \
+            --target "${GITHUB_SHA}" \
+            --title "AzuraCast-LXC ${{ steps.ver.outputs.tag }}" \
+            --notes "Native Debian 13 build of AzuraCast from \`${GITHUB_REF_NAME}\` (${GITHUB_SHA::7}). Install or update with native/install.sh or \`azuracast-ctl update\`." \
+            $flags

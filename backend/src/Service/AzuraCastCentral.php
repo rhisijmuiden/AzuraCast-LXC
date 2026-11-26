@@ -25,6 +25,7 @@ final class AzuraCastCentral
     public function __construct(
         private readonly Version $version,
         private readonly Client $httpClient,
+        private readonly NativeRelease $nativeRelease,
     ) {
     }
 
@@ -33,6 +34,11 @@ final class AzuraCastCentral
      */
     public function checkForUpdates(): UpdateDetails
     {
+        // Native installs (AzuraCast-LXC) get their releases from their own GitHub repository.
+        if ($this->environment->isNative()) {
+            return $this->nativeRelease->checkForUpdates();
+        }
+
         $requestBody = [
             'id' => $this->getUniqueIdentifier(),
             'is_docker' => $this->environment->isDocker(),

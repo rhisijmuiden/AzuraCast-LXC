@@ -144,8 +144,10 @@ final class AppFactory
         $environment = new Environment($rawEnvironment);
 
         // Try to load from .env file
-        if ($environment->isDevelopment() || !$environment->isDocker()) {
-            $envFile = $environment->getBaseDirectory() . '/azuracast.env';
+        if ($environment->isDevelopment() || !$environment->isDocker() || $environment->isNative()) {
+            $envFile = $environment->isNative()
+                ? Environment::NATIVE_ENV_FILE
+                : $environment->getBaseDirectory() . '/azuracast.env';
 
             if (file_exists($envFile)) {
                 $fileContents = file_get_contents($envFile);

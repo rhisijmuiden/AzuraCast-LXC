@@ -1,3 +1,5 @@
+> **AzuraCast-LXC:** this fork installs AzuraCast natively on Debian 13 (no Docker). See [native/README.md](native/README.md) · [Nederlands](native/README.nl.md).
+
 ![](https://github.com/AzuraCast/AzuraCast/raw/main/resources/azuracast.png)![](https://static.scarf.sh/a.png?x-pxid=d5169ead-cdcf-482c-ab64-c7137d3f8769)
 
 # AzuraCast: A Simple, Self-Hosted Web Radio Management Suite

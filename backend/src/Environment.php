@@ -25,6 +25,12 @@ final class Environment
     private readonly string $backendDir;
     private readonly string $parentDir;
     private readonly bool $isDocker;
+    private readonly bool $isNative;
+
+    /** Marker file and settings file used by the native (non-Docker) Debian installation. */
+    public const string NATIVE_MARKER_FILE = '.native';
+    public const string NATIVE_ENV_FILE = '/etc/azuracast/azuracast.env';
+    public const string NATIVE_RELEASE_FILE = '/etc/azuracast/release.env';
     private readonly ApplicationEnvironment $appEnv;
 
     /** @var array<string, string|int|bool|float> */
@@ -82,7 +88,9 @@ final class Environment
         $this->baseDir = dirname(__DIR__, 2);
         $this->backendDir = dirname(__DIR__);
         $this->parentDir = dirname($this->baseDir);
-        $this->isDocker = file_exists($this->parentDir . '/.docker');
+        // A native install mirrors the Docker image layout, so it is treated as "Docker" for paths and sockets.
+        $this->isNative = file_exists($this->parentDir . '/' . self::NATIVE_MARKER_FILE);
+        $this->isDocker = $this->isNative || file_exists($this->parentDir . '/.docker');
 
         if (! $this->isDocker) {
             try {
@@ -138,6 +146,14 @@ final class Environment
     public function isDocker(): bool
     {
         return $this->isDocker;
+    }
+
+    /**
+     * Whether this is a native Debian installation (AzuraCast-LXC) rather than a Docker container.
+     */
+    public function isNative(): bool
+    {
+        return $this->isNative;
     }
 
     public function isProduction(): bool

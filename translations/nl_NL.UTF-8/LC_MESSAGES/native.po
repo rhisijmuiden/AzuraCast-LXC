@@ -1,0 +1,19 @@
+# Dutch strings for AzuraCast-LXC (native Debian installation).
+# Kept apart from default.po (managed by Crowdin upstream) so upstream syncs never conflict.
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+"Language: nl_NL\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "Test channel"
+msgstr "Testkanaal"
+
+msgid "Production channel"
+msgstr "Productiekanaal"
+
+msgid "The native updater service is not available on this installation."
+msgstr "De native updateservice is niet beschikbaar op deze installatie."
+
+msgid "Could not start the update."
+msgstr "De update kon niet worden gestart."
