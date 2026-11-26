@@ -54,7 +54,11 @@ final class DashboardAction implements SingleActionInterface
                 : $router->named('account:logout'),
             version: $this->version->getVersionText(),
             isDocker: $this->environment->isDocker(),
-            platform: ($this->environment->isDocker() ? 'Docker' : 'Ansible')
+            platform: match (true) {
+                $this->environment->isNative() => 'Native (Debian)',
+                $this->environment->isDocker() => 'Docker',
+                default => 'Ansible',
+            }
             . ' &bull; PHP ' . PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION,
             showCharts: $settings->isAnalyticsEnabled(),
             showAlbumArt: !$settings->hide_album_art,

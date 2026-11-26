@@ -152,6 +152,10 @@ final class Version
      */
     public function getVersionText(bool $asHtml = true): string
     {
+        if ($this->environment->isNative()) {
+            return $this->getNativeVersionText();
+        }
+
         $details = $this->getDetails();
         $releaseChannel = $this->getReleaseChannelEnum();
 
@@ -176,6 +180,33 @@ final class Version
         }
 
         return 'v' . self::STABLE_VERSION . ' Stable';
+    }
+
+    /**
+     * Version text for native (AzuraCast-LXC) installations,
+     * e.g. "AzuraCast-LXC v1.0.0 (Test channel) • AzuraCast 0.24.1".
+     */
+    private function getNativeVersionText(): string
+    {
+        $raw = [];
+        if (is_file(Environment::NATIVE_RELEASE_FILE)) {
+            try {
+                $raw = Dotenv::parse((string)file_get_contents(Environment::NATIVE_RELEASE_FILE));
+            } catch (Throwable) {
+                $raw = [];
+            }
+        }
+
+        $channel = ('test' === ($raw['NATIVE_CHANNEL'] ?? 'main'))
+            ? __('Test channel')
+            : __('Production channel');
+
+        return sprintf(
+            'AzuraCast-LXC v%s (%s) • AzuraCast %s',
+            $raw['NATIVE_VERSION'] ?? '0.0.0',
+            $channel,
+            self::STABLE_VERSION
+        );
     }
 
     /**

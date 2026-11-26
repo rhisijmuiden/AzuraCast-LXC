@@ -1,0 +1,23 @@
+[Unit]
+Description=AzuraCast web radio (native, supervisord)
+Documentation=https://github.com/rhisijmuiden/azuracast-lxc
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/azuracast/azuracast.env
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/var/azuracast/storage/shoutcast2
+Environment=HOME=/root
+ExecStartPre=/usr/local/sbin/azuracast-native prestart
+ExecStart=/usr/bin/supervisord -n -c /etc/supervisor/supervisord.conf
+ExecReload=/usr/bin/supervisorctl -c /etc/supervisor/supervisord.conf reread
+KillMode=mixed
+TimeoutStartSec=900
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65000
+
+[Install]
+WantedBy=multi-user.target

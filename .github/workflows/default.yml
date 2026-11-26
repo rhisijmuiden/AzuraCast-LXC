@@ -1,31 +1,12 @@
 name: Build, Test and Publish
+# AzuraCast-LXC: the upstream Docker build/publish is not used in this fork (it needs upstream's
+# registry secrets). The PHP and Node test suites still run on pull requests.
+# Native releases are built by native-release.yml.
 on:
   pull_request:
     branches:
       - main
-  push:
-    paths-ignore:
-      - '*.md'
-      - '.github/*.yml'
-      - '.github/ISSUE_TEMPLATE/*.md'
-      - 'install.sh' # Ansible-only scripts and folders
-      - 'update.sh'
-      - 'util/ansible/**'
-    branches:
-      - ci-testing
-      - main
-      - stable
-      - 'dev-*'
-    tags:
-      - '*'
-  schedule:
-    - cron: '0 2 * * 0' # Weekly on Sundays at 02:00
-  workflow_dispatch:
-    inputs:
-      no_cache:
-        description: 'Build without using cached Docker layers'
-        type: boolean
-        default: false
+      - test
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

@@ -1,0 +1,508 @@
+#!/usr/bin/env bash
+#
+# AzuraCast-LXC: native (non-Docker) setup tool for Debian 13.
+#
+# This replays what the upstream Dockerfile does at build time ("system", "configure") and what the
+# container entrypoint does at start ("prestart"), but directly on the host. Upstream setup and
+# startup scripts in util/docker are reused wherever they are safe outside a container, so upstream
+# version bumps (Liquidsoap, Centrifugo, SFTPGo, ...) flow through automatically.
+#
+# Usage (as root):
+#   azuracast-native install   <release-dir> [--channel main|test] [--tag vX.Y.Z]
+#   azuracast-native system    <release-dir>     install or refresh system packages and components
+#   azuracast-native configure <release-dir>     write configs, scripts and systemd units
+#   azuracast-native deploy    <release-dir>     put the application code in place
+#   azuracast-native prestart                    runtime setup before supervisord starts (systemd)
+#
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=../lib/common.sh
+. "$SELF_DIR/../lib/common.sh"
+
+export DEBIAN_FRONTEND=noninteractive
+
+# Upstream setup scripts that must NOT run natively (Docker-only, or replaced by our own step).
+SKIP_SETUP_SCRIPTS=(
+    "web/setup/php.sh"     # uses the Docker PHP extension installer; we use packages.sury.org
+    "web/setup/cron.sh"    # would put a supercronic crontab into /etc/cron.d (read by Debian cron)
+)
+# Upstream startup scripts that must NOT run natively.
+SKIP_STARTUP_SCRIPTS=(
+    "00_setup_user.sh"           # remaps the container user's UID/GID
+    "02_install_extra_packages.sh" # runs apt at every start; use apt directly instead
+    "05_setup_db.sh"             # needs the MariaDB Docker entrypoint; replaced by 05_native_setup_db.sh
+    "08_plugin_mode.sh"          # composer plugin mode is not supported natively
+)
+
+is_skipped() {
+    local needle="$1"; shift
+    local item
+    for item in "$@"; do [[ "$item" == "$needle" ]] && return 0; done
+    return 1
+}
+
+# ---------------------------------------------------------------------------------------------
+# system: packages and third-party components
+# ---------------------------------------------------------------------------------------------
+
+check_platform() {
+    . /etc/os-release
+    [[ "${ID:-}" == "debian" && "${VERSION_ID:-}" == "13" ]] || die "Debian 13 (trixie) is required (found ${PRETTY_NAME:-unknown})."
+    [[ "$(arch_name)" == "amd64" ]] || die "Only amd64 is supported for now (found $(uname -m))."
+
+    if [[ -r /proc/1/environ ]] && grep -qa 'container=lxc' /proc/1/environ; then
+        if ! unshare --user --map-root-user true 2>/dev/null; then
+            warn "User namespaces are not available in this LXC container. Enable 'nesting' in Proxmox"
+            warn "(Options -> Features -> Nesting), otherwise the Liquidsoap sandbox (bubblewrap) cannot run."
+        fi
+    fi
+}
+
+setup_base() {
+    log "Base packages"
+    if [[ -f /etc/apt/sources.list.d/debian.sources ]]; then
+        sed -i 's/^Components: main$/& contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources
+    elif [[ -f /etc/apt/sources.list ]]; then
+        sed -i -E '/^deb /{/contrib/! s/ main( |$)/ main contrib non-free non-free-firmware\1/}' /etc/apt/sources.list
+    fi
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        apt-transport-https ca-certificates locales lsb-release gosu curl wget tar zip unzip xz-utils \
+        zstd git rsync tzdata gnupg gpg-agent gpgv openssh-client debian-archive-keyring jq sudo \
+        supervisor python3-minimal openssl tmpreaper
+
+    if ! locale -a 2>/dev/null | grep -qi '^en_US.utf8$'; then
+        sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+        grep -q '^en_US.UTF-8 UTF-8' /etc/locale.gen || echo 'en_US.UTF-8 UTF-8' >>/etc/locale.gen
+        locale-gen
+    fi
+}
+
+setup_user() {
+    log "User and directories"
+    if ! id azuracast >/dev/null 2>&1; then
+        adduser --home "$AZ_ROOT" --disabled-password --gecos "" azuracast
+    fi
+    usermod -aG www-data azuracast
+
+    mkdir -p "$AZ_WWW" "$AZ_ROOT/stations" "$AZ_ROOT/www_tmp" "$AZ_ROOT/docs" "$AZ_ROOT/backups" \
+        "$AZ_ROOT/dbip" "$AZ_ROOT/storage/uploads" "$AZ_ROOT/storage/shoutcast2" \
+        "$AZ_ROOT/storage/stereo_tool" "$AZ_ROOT/storage/geoip" "$AZ_ROOT/storage/sftpgo" \
+        "$AZ_ROOT/storage/acme" "$AZ_ROOT/storage/rsas" "$AZ_STAGING" "$AZ_UPDATER_DIR"
+    chown azuracast:azuracast "$AZ_ROOT" "$AZ_ROOT"/{www,stations,www_tmp,docs,backups,dbip,storage} "$AZ_ROOT"/storage/*
+    chmod 777 "$AZ_ROOT/www_tmp"
+
+    # The web updater (PHP, user azuracast) drops a request file here; root's updater service acts on it.
+    chown root:azuracast "$AZ_UPDATER_DIR"
+    chmod 0770 "$AZ_UPDATER_DIR"
+}
+
+setup_php() {
+    log "PHP ${AZ_PHP_VERSION} (packages.sury.org)"
+    if [[ ! -f /etc/apt/sources.list.d/php-sury.list ]]; then
+        curl -fsSL https://packages.sury.org/php/apt.gpg -o /usr/share/keyrings/deb.sury.org-php.gpg
+        echo "deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] https://packages.sury.org/php/ $(lsb_release -sc) main" \
+            >/etc/apt/sources.list.d/php-sury.list
+        apt-get update
+    fi
+
+    local v="$AZ_PHP_VERSION"
+    apt-get install -y --no-install-recommends \
+        "php${v}-cli" "php${v}-fpm" "php${v}-common" "php${v}-gd" "php${v}-curl" "php${v}-xml" \
+        "php${v}-zip" "php${v}-gmp" "php${v}-mysql" "php${v}-mbstring" "php${v}-intl" \
+        "php${v}-redis"
+
+    # Optional speed-ups; the PHP libraries fall back to pure-PHP code without them.
+    local ext
+    for ext in maxminddb uuid; do
+        apt-get install -y --no-install-recommends "php${v}-${ext}" \
+            || warn "php${v}-${ext} is not available; continuing without it."
+    done
+
+    update-alternatives --set php "/usr/bin/php${v}" >/dev/null 2>&1 || true
+    # Upstream supervisor configs call plain "php-fpm".
+    ln -sf "/usr/sbin/php-fpm${v}" /usr/local/sbin/php-fpm
+
+    # Same config locations as the Docker image; rendered at every start by 06_php_conf.sh.
+    mkdir -p /usr/local/etc/php
+    ln -sf /usr/local/etc/php/php.ini "/etc/php/${v}/fpm/conf.d/99-azuracast.ini"
+    ln -sf /usr/local/etc/php/php.ini "/etc/php/${v}/cli/conf.d/99-azuracast.ini"
+    echo 'ffi.enable="true"' >"/etc/php/${v}/mods-available/azuracast-ffi.ini"
+    ln -sf "/etc/php/${v}/mods-available/azuracast-ffi.ini" "/etc/php/${v}/fpm/conf.d/99-azuracast-ffi.ini"
+    ln -sf "/etc/php/${v}/mods-available/azuracast-ffi.ini" "/etc/php/${v}/cli/conf.d/99-azuracast-ffi.ini"
+}
+
+setup_mariadb() {
+    log "MariaDB (Debian 13)"
+    apt-get install -y --no-install-recommends mariadb-server mariadb-backup mariadb-client libjemalloc2 pwgen
+}
+
+# Build a directory laid out like the Docker build context mounts (/bd_build) so the upstream
+# scripts can find their files.
+make_bd_build() {
+    local release="$1" bd="$2"
+    rm -rf "$bd"
+    mkdir -p "$bd"
+    cp -a "$release/util/docker/common/." "$bd/"
+    local part
+    for part in stations web mariadb redis supervisor; do
+        ln -s "$release/util/docker/$part" "$bd/$part"
+    done
+}
+
+# Remove files that upstream setup scripts append to (they assume a fresh image), so re-runs stay clean.
+clean_before_upstream_setup() {
+    rm -f /etc/apt/sources.list.d/deb-multimedia.sources /etc/apt/preferences.d/99deb-multimedia
+    rm -f /usr/local/bin/liquidsoap
+    rm -rf /usr/lib/lv2/master_me.lv2 /usr/lib/lv2/master_me-easy-presets.lv2 /usr/lib/ladspa/master_me.so
+}
+
+run_upstream_setup() {
+    local release="$1"
+    local bd=/bd_build
+    make_bd_build "$release" "$bd"
+    clean_before_upstream_setup
+
+    local group script rel
+    for group in redis stations web; do
+        log "Upstream setup: $group"
+        for script in "$bd/$group/setup/"*.sh; do
+            rel="$group/setup/$(basename "$script")"
+            if is_skipped "$rel" "${SKIP_SETUP_SCRIPTS[@]}"; then
+                echo "   skipping $rel"
+                continue
+            fi
+            echo "   running $rel"
+            bash "$script"
+        done
+    done
+
+    # MariaDB config template (upstream mariadb/setup.sh also wipes /var/lib/mysql, so it is never run).
+    cp "$release/util/docker/mariadb/mariadb/db.cnf.tmpl" /etc/mysql/db.cnf.tmpl
+    mkdir -p /usr/local/share/azuracast
+    cp "$release/util/docker/mariadb/mariadb/db.sql" /usr/local/share/azuracast/db.sql
+
+    # PHP config templates (upstream web/setup/php.sh is skipped).
+    cp "$release/util/docker/web/php/php.ini.tmpl" /usr/local/etc/php/php.ini.tmpl
+    cp "$release/util/docker/web/php/www.conf.tmpl" /usr/local/etc/php-fpm.conf.tmpl
+
+    # Supercronic crontab outside /etc/cron.d so Debian's cron never reads it.
+    cp "$release/util/docker/web/cron/azuracast" "$AZ_ETC/crontab"
+
+    rm -rf "$bd"
+}
+
+setup_icecast_and_docs() {
+    local release="$1"
+    log "Icecast-KH (AzuraCast build) and built-in docs"
+    if [[ -x "$release/native-bin/icecast/bin/icecast" ]]; then
+        install -m 0755 "$release/native-bin/icecast/bin/icecast" /usr/local/bin/icecast
+        rm -rf /usr/local/share/icecast
+        cp -a "$release/native-bin/icecast/share" /usr/local/share/icecast
+    else
+        warn "This release has no Icecast build; Icecast stations will not start."
+    fi
+    if [[ -d "$release/native-bin/docs" ]]; then
+        rsync -a --delete "$release/native-bin/docs/" "$AZ_ROOT/docs/"
+        chown -R azuracast:azuracast "$AZ_ROOT/docs"
+    fi
+}
+
+harden_services() {
+    # The upstream Valkey config binds to all interfaces (fine inside Docker's private network,
+    # not on a host). Keep it on localhost and the unix socket.
+    if [[ -f /etc/valkey/valkey.conf ]]; then
+        sed -i -E 's/^bind .*/bind 127.0.0.1 ::1/; s/^protected-mode no/protected-mode yes/' /etc/valkey/valkey.conf
+    fi
+}
+
+# Debian packages start their own copies of services we run under supervisord. Stop and mask them.
+mask_package_services() {
+    local svc
+    for svc in nginx mariadb "php${AZ_PHP_VERSION}-fpm" valkey-server sftpgo supervisor; do
+        if systemctl list-unit-files "${svc}.service" >/dev/null 2>&1; then
+            systemctl stop "${svc}.service" >/dev/null 2>&1 || true
+            systemctl mask "${svc}.service" >/dev/null 2>&1 || true
+        fi
+    done
+}
+
+cmd_system() {
+    local release="$1"
+    require_root
+    check_platform
+    mkdir -p "$AZ_ETC"
+    setup_base
+    setup_user
+    setup_php
+    setup_mariadb
+    run_upstream_setup "$release"
+    setup_icecast_and_docs "$release"
+    harden_services
+    mask_package_services
+    system_hash "$release" >"$AZ_ETC/system.hash"
+    ok "System components installed."
+}
+
+# Hash of everything that decides which system packages/components are installed.
+system_hash() {
+    local release="$1"
+    (
+        cd "$release"
+        find util/docker native/sbin/azuracast-native native-bin -type f 2>/dev/null | sort | xargs sha256sum
+    ) | sha256sum | cut -d' ' -f1
+}
+
+# ---------------------------------------------------------------------------------------------
+# configure: settings, supervisor, startup scripts, wrappers, systemd
+# ---------------------------------------------------------------------------------------------
+
+write_env_files() {
+    local release="$1" channel="$2" tag="$3"
+    mkdir -p "$AZ_ETC"
+
+    if [[ ! -f "$AZ_ENV_FILE" ]]; then
+        log "Creating $AZ_ENV_FILE"
+        {
+            echo "# AzuraCast-LXC settings. Change values here, then run: azuracast-ctl restart"
+            grep -vE '^\s*(#|$)' "$release/native/env/defaults.env"
+            echo "MYSQL_PASSWORD=$(openssl rand -hex 16)"
+        } >"$AZ_ENV_FILE"
+    else
+        # Add keys that newer releases introduced, keep everything the admin set.
+        local line key
+        while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+            key="${line%%=*}"
+            grep -qE "^${key}=" "$AZ_ENV_FILE" || echo "$line" >>"$AZ_ENV_FILE"
+        done <"$release/native/env/defaults.env"
+    fi
+    env_set "$AZ_ENV_FILE" AZURACAST_VERSION "$(channel_to_release_channel "$channel")"
+    chown root:azuracast "$AZ_ENV_FILE"
+    chmod 0640 "$AZ_ENV_FILE"
+
+    local version
+    version="$(cat "$release/native/VERSION")"
+    [[ -n "$tag" ]] || tag="v${version}"
+    {
+        echo "NATIVE_VERSION=${tag#v}"
+        echo "NATIVE_TAG=${tag}"
+        echo "NATIVE_CHANNEL=${channel}"
+        echo "NATIVE_REPOSITORY=${AZ_REPOSITORY:-$AZ_REPO_DEFAULT}"
+        echo "NATIVE_INSTALLED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } >"$AZ_RELEASE_FILE"
+    chmod 0644 "$AZ_RELEASE_FILE"
+}
+
+# Upstream supervisor program files log to /proc/1/fd/*, which only works when supervisord is PID 1.
+# Rewrite those to log files in www_tmp (they then also show up under Administration > Logs).
+rewrite_supervisor_logging() {
+    local file="$1"
+    python3 - "$file" <<'PY'
+import re, sys
+path = sys.argv[1]
+out, prog = [], None
+for line in open(path).read().splitlines():
+    m = re.match(r'\[program:([^\]]+)\]', line)
+    if m:
+        prog = m.group(1)
+    if line.startswith('stdout_logfile=/proc/1/fd/'):
+        out.append(f'stdout_logfile=/var/azuracast/www_tmp/service_{prog}.log')
+        continue
+    if line.startswith('stdout_logfile_maxbytes=0'):
+        out.append('stdout_logfile_maxbytes=5MB')
+        out.append('stdout_logfile_backups=5')
+        out.append('redirect_stderr=true')
+        continue
+    if line.startswith('stderr_logfile'):
+        continue
+    out.append(line)
+open(path, 'w').write('\n'.join(out) + '\n')
+PY
+}
+
+write_supervisor() {
+    local release="$1"
+    log "Supervisor configuration"
+    mkdir -p /etc/supervisor/minimal.conf.d /etc/supervisor/full.conf.d
+    rm -f /etc/supervisor/minimal.conf.d/*.conf /etc/supervisor/full.conf.d/*.conf /etc/supervisor/conf.d/*.conf
+    cp "$release/native/supervisor/supervisord.conf" /etc/supervisor/supervisord.conf
+
+    cp "$release/util/docker/mariadb/service.minimal/"*.conf /etc/supervisor/minimal.conf.d/
+    cp "$release/util/docker/redis/service.minimal/"*.conf /etc/supervisor/minimal.conf.d/
+    cp "$release/util/docker/web/service.full/"*.conf /etc/supervisor/full.conf.d/
+    # Our cron program reads the crontab from /etc/azuracast.
+    sed -i "s#/etc/cron.d/azuracast#$AZ_ETC/crontab#" /etc/supervisor/full.conf.d/cron.conf
+
+    local f
+    for f in /etc/supervisor/minimal.conf.d/*.conf /etc/supervisor/full.conf.d/*.conf; do
+        rewrite_supervisor_logging "$f"
+    done
+}
+
+write_startup_scripts() {
+    local release="$1"
+    log "Startup scripts"
+    mkdir -p /etc/my_init.d
+    rm -f /etc/my_init.d/*.sh
+
+    local group script name
+    for group in mariadb redis web; do
+        for script in "$release/util/docker/$group/startup_scripts/"*.sh; do
+            [[ -f "$script" ]] || continue
+            name="$(basename "$script")"
+            if is_skipped "$name" "${SKIP_STARTUP_SCRIPTS[@]}"; then
+                continue
+            fi
+            cp "$script" "/etc/my_init.d/$name"
+        done
+    done
+    cp "$release/native/startup/"*.sh /etc/my_init.d/
+    chmod 0755 /etc/my_init.d/*.sh
+}
+
+# Install upstream helper scripts (azuracast_cli, azuracast_db, ...) behind small wrappers that load
+# /etc/azuracast/azuracast.env first, the way every shell inside the Docker container had them.
+write_scripts() {
+    local release="$1"
+    log "Command-line tools"
+    mkdir -p "$AZ_LIB/bin" "$AZ_LIB/native"
+    rm -rf "${AZ_LIB:?}/bin/"*
+
+    local dir script name
+    for dir in "$release/util/docker/web/scripts" "$release/util/docker/mariadb/scripts"; do
+        for script in "$dir"/*; do
+            [[ -f "$script" ]] || continue
+            name="$(basename "$script")"
+            [[ "$name" == "docker_installer" ]] && continue
+            install -m 0755 "$script" "$AZ_LIB/bin/$name"
+            cat >"/usr/local/bin/$name" <<EOF
+#!/bin/sh
+# AzuraCast-LXC wrapper: load settings, then run the upstream script.
+if [ -r $AZ_ENV_FILE ]; then set -a; . $AZ_ENV_FILE; set +a; fi
+exec $AZ_LIB/bin/$name "\$@"
+EOF
+            chmod 0755 "/usr/local/bin/$name"
+        done
+    done
+
+    # Our own tools.
+    rsync -a --delete "$release/native/" "$AZ_LIB/native/"
+    chmod 0755 "$AZ_LIB/native/sbin/"*
+    ln -sf "$AZ_LIB/native/sbin/azuracast-ctl" /usr/local/sbin/azuracast-ctl
+    ln -sf "$AZ_LIB/native/sbin/azuracast-native" /usr/local/sbin/azuracast-native
+}
+
+write_systemd() {
+    local release="$1"
+    log "systemd units"
+    cp "$release/native/systemd/"*.service "$release/native/systemd/"*.path /etc/systemd/system/
+    systemctl daemon-reload
+    systemctl enable azuracast.service azuracast-updater.path >/dev/null
+    systemctl start azuracast-updater.path || true
+}
+
+cmd_configure() {
+    local release="$1" channel="${2:-main}" tag="${3:-}"
+    require_root
+    write_env_files "$release" "$channel" "$tag"
+    write_supervisor "$release"
+    write_startup_scripts "$release"
+    write_scripts "$release"
+    write_systemd "$release"
+    ok "Configuration written."
+}
+
+# ---------------------------------------------------------------------------------------------
+# deploy: put the application in /var/azuracast/www (keeps the previous one for rollback)
+# ---------------------------------------------------------------------------------------------
+
+cmd_deploy() {
+    local release="$1"
+    require_root
+    log "Deploying application code"
+
+    local next="$AZ_ROOT/www.next"
+    rm -rf "$next"
+    mkdir -p "$next"
+    rsync -a --exclude 'native-bin/' "$release/" "$next/"
+    chown -R azuracast:azuracast "$next"
+    chmod a+x "$next/backend/bin/"*
+
+    if [[ -d "$AZ_WWW" ]] && [[ -n "$(ls -A "$AZ_WWW" 2>/dev/null)" ]]; then
+        rm -rf "$AZ_ROOT/www.previous"
+        mv "$AZ_WWW" "$AZ_ROOT/www.previous"
+    else
+        rm -rf "$AZ_WWW"
+    fi
+    mv "$next" "$AZ_WWW"
+
+    # Tells the application it runs natively (see App\Environment::isNative()).
+    touch "$AZ_ROOT/.native"
+    chown azuracast:azuracast "$AZ_ROOT/.native"
+    ok "Application code in place."
+}
+
+# ---------------------------------------------------------------------------------------------
+# prestart: what the container entrypoint (my_init) did before supervisord, run by systemd
+# ---------------------------------------------------------------------------------------------
+
+cmd_prestart() {
+    load_env "$AZ_ENV_FILE"
+    export ACME_DIR="${ACME_DIR:-$AZ_ROOT/storage/acme}"
+    export UPLOADS_DIR="${UPLOADS_DIR:-$AZ_ROOT/storage/uploads}"
+
+    local f
+    for f in /etc/my_init.d/*.sh; do
+        echo "** Running startup script '$f'..."
+        bash "$f" -H || warn "Startup script $f returned an error."
+    done
+    echo "** Startup scripts complete."
+}
+
+# ---------------------------------------------------------------------------------------------
+
+cmd_install() {
+    local release="$1"; shift
+    local channel="main" tag=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --channel) channel="$2"; shift 2 ;;
+            --tag) tag="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+    [[ "$channel" == "main" || "$channel" == "test" ]] || die "Channel must be main or test."
+
+    cmd_system "$release"
+    cmd_deploy "$release"
+    cmd_configure "$release" "$channel" "$tag"
+
+    log "Starting AzuraCast"
+    systemctl restart azuracast.service
+    local port
+    port="$(env_get "$AZ_ENV_FILE" AZURACAST_HTTP_PORT)"
+    if wait_for_http "http://127.0.0.1:${port:-80}/api/status" 600; then
+        ok "AzuraCast is running."
+    else
+        warn "AzuraCast did not answer within 10 minutes. Check: azuracast-ctl status / azuracast-ctl logs"
+        return 1
+    fi
+}
+
+main() {
+    local cmd="${1:-}"
+    shift || true
+    case "$cmd" in
+        install) [[ $# -ge 1 ]] || die "Usage: azuracast-native install <release-dir> [--channel main|test]"; cmd_install "$@" ;;
+        system) cmd_system "${1:?release dir}" ;;
+        configure) cmd_configure "${1:?release dir}" "${2:-main}" "${3:-}" ;;
+        deploy) cmd_deploy "${1:?release dir}" ;;
+        prestart) cmd_prestart ;;
+        system-hash) system_hash "${1:?release dir}" ;;
+        *) sed -n '2,17p' "$0"; exit 1 ;;
+    esac
+}
+
+main "$@"

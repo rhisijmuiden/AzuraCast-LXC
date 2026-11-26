@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+#
+# azuracast-ctl: manage a native AzuraCast-LXC installation.
+#
+#   azuracast-ctl status                 service and process status
+#   azuracast-ctl start|stop|restart     control the whole stack
+#   azuracast-ctl logs [program]         follow logs (supervisord, or one program such as nginx)
+#   azuracast-ctl version                installed release, channel and AzuraCast version
+#   azuracast-ctl check                  check GitHub for a newer release on the current channel
+#   azuracast-ctl update [--channel main|test] [--tag vX.Y.Z] [--force]
+#                                        update (with database backup and automatic rollback)
+#   azuracast-ctl channel main|test      switch channel and install its newest release
+#   azuracast-ctl backup [args]          AzuraCast backup   (azuracast:backup)
+#   azuracast-ctl restore <file> [args]  AzuraCast restore  (azuracast:restore)
+#   azuracast-ctl cli <command> [args]   run an AzuraCast console command
+#   azuracast-ctl db                     MariaDB shell on the AzuraCast database
+#
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=../lib/common.sh
+. "$SELF_DIR/../lib/common.sh"
+
+PRE_UPDATE_DIR="$AZ_ROOT/backups/pre-update"
+UPDATE_LOG="$AZ_UPDATER_DIR/update.log"
+STATUS_FILE="$AZ_UPDATER_DIR/status.json"
+
+usage() { sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'; }
+
+current() { env_get "$AZ_RELEASE_FILE" "$1"; }
+
+repo() {
+    local r
+    r="$(current NATIVE_REPOSITORY)"
+    echo "${r:-$AZ_REPO_DEFAULT}"
+}
+
+http_port() {
+    local p
+    p="$(env_get "$AZ_ENV_FILE" AZURACAST_HTTP_PORT)"
+    echo "${p:-80}"
+}
+
+write_status() {
+    local state="$1" message="$2"
+    mkdir -p "$AZ_UPDATER_DIR"
+    jq -n --arg s "$state" --arg m "$message" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{state: $s, message: $m, at: $t}' >"$STATUS_FILE"
+    chgrp azuracast "$STATUS_FILE" 2>/dev/null || true
+    chmod 0640 "$STATUS_FILE"
+}
+
+cmd_status() {
+    systemctl --no-pager status azuracast.service | head -n 5 || true
+    echo
+    if [[ -S /var/run/supervisor.sock ]]; then
+        supervisorctl -c /etc/supervisor/supervisord.conf status || true
+    fi
+}
+
+cmd_logs() {
+    if [[ $# -eq 0 ]]; then
+        exec tail -n 100 -F "$AZ_ROOT/www_tmp/supervisord.log"
+    fi
+    exec tail -n 100 -F "$AZ_ROOT/www_tmp/service_$1.log"
+}
+
+cmd_version() {
+    echo "AzuraCast-LXC: $(current NATIVE_TAG) ($(current NATIVE_CHANNEL) channel)"
+    echo "Installed:     $(current NATIVE_INSTALLED_AT)"
+    if [[ -f "$AZ_WWW/.gitinfo" ]]; then
+        echo "Commit:        $(grep COMMIT_LONG "$AZ_WWW/.gitinfo" | cut -d'"' -f2 | cut -c1-7)"
+    fi
+    local upstream
+    upstream="$(grep -oE "STABLE_VERSION = '[^']+'" "$AZ_WWW/backend/src/Version.php" | cut -d"'" -f2 || true)"
+    echo "AzuraCast:     ${upstream:-unknown}"
+}
+
+cmd_check() {
+    local channel tag latest
+    channel="$(current NATIVE_CHANNEL)"
+    tag="$(current NATIVE_TAG)"
+    latest="$(resolve_release_tag "$(repo)" "${channel:-main}")"
+    [[ -n "$latest" ]] || die "No release found on the ${channel:-main} channel."
+    if [[ "$latest" == "$tag" ]]; then
+        ok "Up to date ($tag, ${channel} channel)."
+    else
+        echo "Update available: $tag -> $latest (${channel} channel). Run: azuracast-ctl update"
+    fi
+}
+
+db_dump() {
+    local label="$1"
+    mkdir -p "$PRE_UPDATE_DIR"
+    chmod 0700 "$PRE_UPDATE_DIR"
+    local db file
+    db="$(env_get "$AZ_ENV_FILE" MYSQL_DATABASE)"
+    file="$PRE_UPDATE_DIR/${label}-$(date +%Y%m%d-%H%M%S).sql.zst"
+    mariadb-dump --socket=/run/mysqld/mysqld.sock --single-transaction --routines --triggers \
+        --databases "${db:-azuracast}" | zstd -q -o "$file"
+    # Keep the five most recent dumps.
+    ls -1t "$PRE_UPDATE_DIR"/*.sql.zst 2>/dev/null | tail -n +6 | xargs -r rm -f
+    echo "$file"
+}
+
+db_restore() {
+    local file="$1"
+    zstd -dc "$file" | mariadb --socket=/run/mysqld/mysqld.sock
+}
+
+service_healthy() {
+    wait_for_http "http://127.0.0.1:$(http_port)/api/status" "${1:-600}"
+}
+
+do_update() {
+    local channel="$1" tag="$2" force="$3"
+    local from_tag from_channel
+    from_tag="$(current NATIVE_TAG)"
+    from_channel="$(current NATIVE_CHANNEL)"
+    [[ -n "$channel" ]] || channel="${from_channel:-main}"
+    [[ "$channel" == "main" || "$channel" == "test" ]] || die "Channel must be main or test."
+
+    write_status running "Checking for updates"
+    if [[ -z "$tag" ]]; then
+        tag="$(resolve_release_tag "$(repo)" "$channel")"
+        [[ -n "$tag" ]] || die "No release found on the $channel channel."
+    fi
+
+    if [[ "$tag" == "$from_tag" && "$channel" == "$from_channel" && "$force" != "1" ]]; then
+        ok "Already on $tag ($channel channel)."
+        write_status "done" "Already up to date ($tag)"
+        return 0
+    fi
+
+    log "Updating $from_tag ($from_channel) -> $tag ($channel)"
+    write_status running "Downloading $tag"
+    local stage="$AZ_STAGING/$tag"
+    rm -rf "$stage"
+    local release
+    release="$(download_release "$(repo)" "$tag" "$stage")"
+
+    # System packages/components only when the release changed them.
+    local new_hash old_hash
+    new_hash="$(bash "$release/native/sbin/azuracast-native" system-hash "$release")"
+    old_hash="$(cat "$AZ_ETC/system.hash" 2>/dev/null || true)"
+    if [[ "$new_hash" != "$old_hash" ]]; then
+        write_status running "Updating system components"
+        bash "$release/native/sbin/azuracast-native" system "$release"
+    fi
+
+    local dump=""
+    if systemctl is-active --quiet azuracast.service && [[ -S /run/mysqld/mysqld.sock ]]; then
+        write_status running "Backing up the database"
+        dump="$(db_dump "${from_tag:-unknown}")"
+        ok "Database backup: $dump"
+    else
+        warn "AzuraCast is not running; skipping the pre-update database backup."
+    fi
+
+    cp -a "$AZ_RELEASE_FILE" "$AZ_ETC/release.env.previous" 2>/dev/null || true
+
+    write_status running "Installing $tag"
+    systemctl stop azuracast.service
+    bash "$release/native/sbin/azuracast-native" deploy "$release"
+    bash "$release/native/sbin/azuracast-native" configure "$release" "$channel" "$tag"
+    systemctl start azuracast.service
+
+    if service_healthy 600; then
+        rm -rf "$stage"
+        write_status "done" "Updated to $tag"
+        ok "Updated to $tag ($channel channel)."
+        return 0
+    fi
+
+    warn "AzuraCast did not come back after the update. Rolling back to $from_tag."
+    write_status running "Update failed, rolling back to $from_tag"
+    rollback "$from_channel" "$from_tag" "$dump"
+    write_status failed "Update to $tag failed; rolled back to $from_tag"
+    die "Update to $tag failed and was rolled back. See $UPDATE_LOG"
+}
+
+rollback() {
+    local channel="$1" tag="$2" dump="$3"
+    [[ -d "$AZ_ROOT/www.previous" ]] || die "No previous version to roll back to."
+
+    systemctl stop azuracast.service || true
+    rm -rf "$AZ_ROOT/www.failed"
+    mv "$AZ_WWW" "$AZ_ROOT/www.failed"
+    mv "$AZ_ROOT/www.previous" "$AZ_WWW"
+    bash "$AZ_WWW/native/sbin/azuracast-native" configure "$AZ_WWW" "${channel:-main}" "$tag"
+    [[ -f "$AZ_ETC/release.env.previous" ]] && cp -a "$AZ_ETC/release.env.previous" "$AZ_RELEASE_FILE"
+    systemctl start azuracast.service
+
+    if [[ -n "$dump" && -f "$dump" ]]; then
+        for _ in $(seq 1 60); do [[ -S /run/mysqld/mysqld.sock ]] && break; sleep 2; done
+        log "Restoring database from $dump"
+        db_restore "$dump"
+        systemctl restart azuracast.service
+    fi
+    service_healthy 600 || warn "The previous version did not come back either. Check: azuracast-ctl status"
+}
+
+cmd_update() {
+    require_root
+    local channel="" tag="" force=0 from_request=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --channel) channel="$2"; shift 2 ;;
+            --tag) tag="$2"; shift 2 ;;
+            --force) force=1; shift ;;
+            --from-request) from_request=1; shift ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    if [[ $from_request -eq 1 ]]; then
+        local req="$AZ_UPDATER_DIR/request"
+        [[ -f "$req" ]] || exit 0
+        local wanted
+        wanted="$(jq -r '.channel // empty' "$req" 2>/dev/null || true)"
+        rm -f "$req"
+        # Only a known channel name is accepted from the web interface.
+        if [[ "$wanted" == "main" || "$wanted" == "test" ]]; then channel="$wanted"; fi
+        tag=""; force=0
+    fi
+
+    exec 9>/run/azuracast-update.lock
+    flock -n 9 || die "Another update is already running."
+
+    mkdir -p "$AZ_UPDATER_DIR"
+    do_update "$channel" "$tag" "$force" 2>&1 | tee -a "$UPDATE_LOG"
+    return "${PIPESTATUS[0]}"
+}
+
+main() {
+    local cmd="${1:-}"
+    shift || true
+    case "$cmd" in
+        status) cmd_status ;;
+        start|stop|restart) require_root; systemctl "$cmd" azuracast.service ;;
+        logs) cmd_logs "$@" ;;
+        version) cmd_version ;;
+        check) cmd_check ;;
+        update) cmd_update "$@" ;;
+        channel)
+            [[ "${1:-}" == "main" || "${1:-}" == "test" ]] || die "Usage: azuracast-ctl channel main|test"
+            cmd_update --channel "$1" --force ;;
+        backup) exec azuracast_cli azuracast:backup "$@" ;;
+        restore) exec azuracast_restore "$@" ;;
+        cli) exec azuracast_cli "$@" ;;
+        db) exec azuracast_db "$@" ;;
+        ""|-h|--help|help) usage ;;
+        *) usage; exit 1 ;;
+    esac
+}
+
+main "$@"
