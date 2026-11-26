@@ -139,15 +139,6 @@ do_update() {
     local release
     release="$(download_release "$(repo)" "$tag" "$stage")"
 
-    # System packages/components only when the release changed them.
-    local new_hash old_hash
-    new_hash="$(bash "$release/native/sbin/azuracast-native" system-hash "$release")"
-    old_hash="$(cat "$AZ_ETC/system.hash" 2>/dev/null || true)"
-    if [[ "$new_hash" != "$old_hash" ]]; then
-        write_status running "Updating system components"
-        bash "$release/native/sbin/azuracast-native" system "$release"
-    fi
-
     local dump=""
     if systemctl is-active --quiet azuracast.service && [[ -S /run/mysqld/mysqld.sock ]]; then
         write_status running "Backing up the database"
@@ -159,10 +150,33 @@ do_update() {
 
     cp -a "$AZ_RELEASE_FILE" "$AZ_ETC/release.env.previous" 2>/dev/null || true
 
-    write_status running "Installing $tag"
+    # From here AzuraCast is down. The system step replaces binaries that are in use while it runs
+    # (supercronic, centrifugo, ...), so stop it first. If anything fails before the new code is in
+    # place, start the old version again.
+    write_status running "Stopping AzuraCast"
     systemctl stop azuracast.service
-    bash "$release/native/sbin/azuracast-native" deploy "$release"
-    bash "$release/native/sbin/azuracast-native" configure "$release" "$channel" "$tag"
+
+    local new_hash old_hash
+    new_hash="$(bash "$release/native/sbin/azuracast-native" system-hash "$release")"
+    old_hash="$(cat "$AZ_ETC/system.hash" 2>/dev/null || true)"
+    if [[ "$new_hash" != "$old_hash" ]]; then
+        write_status running "Updating system components"
+        if ! bash "$release/native/sbin/azuracast-native" system "$release"; then
+            warn "Updating system components failed; starting the current version again."
+            systemctl start azuracast.service || true
+            write_status failed "Update to $tag failed while updating system components; still on $from_tag"
+            die "Update to $tag failed while updating system components. See $UPDATE_LOG"
+        fi
+    fi
+
+    write_status running "Installing $tag"
+    if ! bash "$release/native/sbin/azuracast-native" deploy "$release" \
+        || ! bash "$release/native/sbin/azuracast-native" configure "$release" "$channel" "$tag"; then
+        warn "Installing $tag failed. Rolling back to $from_tag."
+        rollback "$from_channel" "$from_tag" "$dump"
+        write_status failed "Update to $tag failed; rolled back to $from_tag"
+        die "Update to $tag failed and was rolled back. See $UPDATE_LOG"
+    fi
     systemctl start azuracast.service
 
     if service_healthy 600; then
