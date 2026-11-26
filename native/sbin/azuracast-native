@@ -154,6 +154,8 @@ make_bd_build() {
 # Remove files that upstream setup scripts append to (they assume a fresh image), so re-runs stay clean.
 clean_before_upstream_setup() {
     rm -f /etc/apt/sources.list.d/deb-multimedia.sources /etc/apt/preferences.d/99deb-multimedia
+    # "gpg --dearmor -o" asks before overwriting an existing keyring, which fails without a terminal.
+    rm -f /usr/share/keyrings/nginx-archive-keyring.gpg
     rm -f /usr/local/bin/liquidsoap
     rm -rf /usr/lib/lv2/master_me.lv2 /usr/lib/lv2/master_me-easy-presets.lv2 /usr/lib/ladspa/master_me.so
 }
