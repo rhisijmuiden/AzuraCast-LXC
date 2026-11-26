@@ -183,7 +183,8 @@ final class Version
     }
 
     /**
-     * Version text for native (AzuraCast-LXC) installations, e.g. "AzuraCast-LXC v1.0.0 (Test channel) • AzuraCast 0.24.1".
+     * Version text for native (AzuraCast-LXC) installations,
+     * e.g. "AzuraCast-LXC v1.0.0 (Test channel) • AzuraCast 0.24.1".
      */
     private function getNativeVersionText(): string
     {
